@@ -100,6 +100,10 @@ class CanvasView(QGraphicsView):
         self.mask_item.setPixmap(QPixmap.fromImage(qimg))
 
     def save_undo_state(self):
+        # --- NUEVO: Proteger contra clic sin imagen ---
+        if self.label_array is None: 
+            return
+            
         self.undo_stack.append(self.label_array.copy())
         if len(self.undo_stack) > 20:
             self.undo_stack.pop(0)
@@ -126,6 +130,10 @@ class CanvasView(QGraphicsView):
             self._pan_start = event.pos()
             self.setCursor(Qt.CursorShape.ClosedHandCursor)
         elif event.button() == Qt.MouseButton.LeftButton:
+            # --- NUEVO: Proteger contra clic sin imagen ---
+            if self.label_array is None: 
+                return
+                
             self.save_undo_state()
             self.drawing = True
             scene_pos = self.mapToScene(event.pos())
@@ -193,8 +201,8 @@ class MainWindow(QMainWindow):
 
         top_layout = QHBoxLayout()
         
-        self.btn_load = QPushButton("Cargar MP4")
-        self.btn_load.clicked.connect(self.load_video)
+        self.btn_load = QPushButton("Cargar (MP4 / NPZ)")
+        self.btn_load.clicked.connect(self.load_file)
         
         # --- NUEVO: Control de cantidad de frames a extraer ---
         self.spin_frames = QSpinBox()
@@ -303,19 +311,48 @@ class MainWindow(QMainWindow):
         self.canvas.thresh_metralla = value
         self.lbl_val_metralla.setText(str(value))
 
-    def load_video(self):
-        file_path, _ = QFileDialog.getOpenFileName(self, "Seleccionar Video", "", "Videos (*.mp4 *.avi)")
+    def load_file(self):
+        file_path, _ = QFileDialog.getOpenFileName(
+            self, 
+            "Seleccionar Archivo", 
+            "", 
+            "Videos y Datasets (*.mp4 *.avi *.npz)"
+        )
+        
         if file_path:
-            self.lbl_status.setText("Procesando video...")
+            self.lbl_status.setText("Procesando archivo...")
             QApplication.processEvents()
-            # Usar la cantidad de frames seleccionada en la UI
-            num_frames = self.spin_frames.value()
-            self.frames = VideoProcessor.extract_climax_sequence(file_path, num_frames=num_frames)
-            if self.frames:
-                self.labels_list = [np.zeros_like(f) for f in self.frames]
-                self.current_idx = 0
-                self.canvas.initial_fit_done = False 
-                self.update_display()
+            
+            # --- Si es un dataset guardado (.npz) ---
+            if file_path.endswith('.npz'):
+                try:
+                    data = np.load(file_path)
+                    if 'inputs' not in data or 'targets' not in data:
+                        raise ValueError("El archivo .npz no tiene las claves correctas.")
+                    
+                    # Desempaquetar el tensor 3D de vuelta a una lista de matrices 2D
+                    self.frames = list(data['inputs'])
+                    self.labels_list = list(data['targets'])
+                    
+                    self.current_idx = 0
+                    self.canvas.initial_fit_done = False 
+                    self.update_display()
+                    self.lbl_status.setText(f"Dataset NPZ cargado: {len(self.frames)} frames")
+                except Exception as e:
+                    QMessageBox.critical(self, "Error", f"No se pudo leer el archivo:\n{e}")
+                    self.lbl_status.setText("Error al cargar.")
+                    
+            # --- Si es un video crudo (.mp4, .avi) ---
+            else:
+                num_frames = self.spin_frames.value()
+                self.frames = VideoProcessor.extract_climax_sequence(file_path, num_frames=num_frames)
+                if self.frames:
+                    self.labels_list = [np.zeros_like(f) for f in self.frames]
+                    self.current_idx = 0
+                    self.canvas.initial_fit_done = False 
+                    self.update_display()
+                else:
+                    self.lbl_status.setText("No se pudo extraer la secuencia.")
 
     def update_display(self):
         if not self.frames: return
