@@ -7,7 +7,7 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QGraphicsView, QGraphics
                              QLabel, QRadioButton, QButtonGroup, QSlider, QGroupBox, QMessageBox,
                              QSpinBox)
 from PyQt6.QtGui import QImage, QPixmap
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, QTimer, QEvent
 
 class VideoProcessor:
     @staticmethod
@@ -26,7 +26,6 @@ class VideoProcessor:
         sums = [np.sum(d) for d in diffs]
         peak_idx = np.argmax(sums)
 
-        # Empezamos justo en el clímax (o un frame antes por seguridad) y extraemos hacia el futuro
         start = max(0, peak_idx - 1)
         end = min(len(diffs), start + num_frames)
 
@@ -40,7 +39,6 @@ class CanvasView(QGraphicsView):
         self.image_item = self.scene.addPixmap(QPixmap())
         self.setDragMode(QGraphicsView.DragMode.NoDrag)
         
-        # --- FIX ZOOM: Anclar el zoom al puntero del ratón ---
         self.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
         
         self.current_diff_array = None
@@ -100,7 +98,6 @@ class CanvasView(QGraphicsView):
         self.mask_item.setPixmap(QPixmap.fromImage(qimg))
 
     def save_undo_state(self):
-        # --- NUEVO: Proteger contra clic sin imagen ---
         if self.label_array is None: 
             return
             
@@ -108,7 +105,6 @@ class CanvasView(QGraphicsView):
         if len(self.undo_stack) > 20:
             self.undo_stack.pop(0)
 
-    # --- FIX ZOOM: Sobrescribir evento de rueda y aceptarlo para evitar scrolleo ---
     def wheelEvent(self, event):
         zoom_in_factor = 1.15
         zoom_out_factor = 1 / zoom_in_factor
@@ -130,7 +126,6 @@ class CanvasView(QGraphicsView):
             self._pan_start = event.pos()
             self.setCursor(Qt.CursorShape.ClosedHandCursor)
         elif event.button() == Qt.MouseButton.LeftButton:
-            # --- NUEVO: Proteger contra clic sin imagen ---
             if self.label_array is None: 
                 return
                 
@@ -195,6 +190,11 @@ class MainWindow(QMainWindow):
         self.labels_list = [] 
         self.current_idx = 0
 
+        self.playback_timer = QTimer(self)
+        self.playback_timer.setInterval(67) 
+        self.playback_timer.timeout.connect(self.step_playback)
+        self.playback_direction = 0  
+
         main_widget = QWidget()
         self.setCentralWidget(main_widget)
         layout = QVBoxLayout(main_widget)
@@ -204,7 +204,6 @@ class MainWindow(QMainWindow):
         self.btn_load = QPushButton("Cargar (MP4 / NPZ)")
         self.btn_load.clicked.connect(self.load_file)
         
-        # --- NUEVO: Control de cantidad de frames a extraer ---
         self.spin_frames = QSpinBox()
         self.spin_frames.setRange(10, 500)
         self.spin_frames.setValue(120)
@@ -279,10 +278,10 @@ class MainWindow(QMainWindow):
         top_layout.addStretch()
 
         nav_layout = QHBoxLayout()
-        self.btn_prev = QPushButton("< Anterior")
+        self.btn_prev = QPushButton("< Anterior (E)")
         self.btn_prev.clicked.connect(self.prev_frame)
         self.lbl_status = QLabel("Esperando video...")
-        self.btn_next = QPushButton("Siguiente >")
+        self.btn_next = QPushButton("Siguiente (R) >")
         self.btn_next.clicked.connect(self.next_frame)
 
         nav_layout.addWidget(self.btn_prev)
@@ -293,6 +292,42 @@ class MainWindow(QMainWindow):
         self.canvas = CanvasView()
         layout.addWidget(self.canvas)
         layout.addLayout(nav_layout)
+
+        # Instalar el filtro global de eventos para asegurar que E y R siempre funcionen
+        QApplication.instance().installEventFilter(self)
+
+    def eventFilter(self, obj, event):
+        if event.type() == QEvent.Type.KeyPress:
+            if not event.isAutoRepeat():
+                if event.key() == Qt.Key.Key_R:
+                    self.playback_direction = 1
+                    if not self.playback_timer.isActive():
+                        self.playback_timer.start()
+                    return True 
+                elif event.key() == Qt.Key.Key_E:
+                    self.playback_direction = -1
+                    if not self.playback_timer.isActive():
+                        self.playback_timer.start()
+                    return True
+
+        elif event.type() == QEvent.Type.KeyRelease:
+            if not event.isAutoRepeat():
+                if event.key() == Qt.Key.Key_R and self.playback_direction == 1:
+                    self.playback_timer.stop()
+                    self.playback_direction = 0
+                    return True
+                elif event.key() == Qt.Key.Key_E and self.playback_direction == -1:
+                    self.playback_timer.stop()
+                    self.playback_direction = 0
+                    return True
+
+        return super().eventFilter(obj, event)
+
+    def step_playback(self):
+        if self.playback_direction == 1:
+            self.next_frame()
+        elif self.playback_direction == -1:
+            self.prev_frame()
 
     def change_tool(self, button):
         if button == self.radio_humo: self.canvas.active_tool = "humo"
@@ -323,14 +358,12 @@ class MainWindow(QMainWindow):
             self.lbl_status.setText("Procesando archivo...")
             QApplication.processEvents()
             
-            # --- Si es un dataset guardado (.npz) ---
             if file_path.endswith('.npz'):
                 try:
                     data = np.load(file_path)
                     if 'inputs' not in data or 'targets' not in data:
                         raise ValueError("El archivo .npz no tiene las claves correctas.")
                     
-                    # Desempaquetar el tensor 3D de vuelta a una lista de matrices 2D
                     self.frames = list(data['inputs'])
                     self.labels_list = list(data['targets'])
                     
@@ -341,8 +374,6 @@ class MainWindow(QMainWindow):
                 except Exception as e:
                     QMessageBox.critical(self, "Error", f"No se pudo leer el archivo:\n{e}")
                     self.lbl_status.setText("Error al cargar.")
-                    
-            # --- Si es un video crudo (.mp4, .avi) ---
             else:
                 num_frames = self.spin_frames.value()
                 self.frames = VideoProcessor.extract_climax_sequence(file_path, num_frames=num_frames)
