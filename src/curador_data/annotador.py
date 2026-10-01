@@ -5,8 +5,8 @@ import numpy as np
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QGraphicsView, QGraphicsScene, 
                              QVBoxLayout, QHBoxLayout, QPushButton, QWidget, QFileDialog, 
                              QLabel, QRadioButton, QButtonGroup, QSlider, QGroupBox, QMessageBox,
-                             QSpinBox)
-from PyQt6.QtGui import QImage, QPixmap
+                             QSpinBox, QGraphicsEllipseItem)
+from PyQt6.QtGui import QImage, QPixmap, QPen, QColor
 from PyQt6.QtCore import Qt, QTimer, QEvent
 
 class VideoProcessor:
@@ -41,6 +41,9 @@ class CanvasView(QGraphicsView):
         
         self.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
         
+        # Activar el rastreo del mouse para dibujar el cursor sin hacer clic
+        self.setMouseTracking(True)
+        
         self.current_diff_array = None
         self.label_array = None 
         self.mask_item = None
@@ -56,6 +59,30 @@ class CanvasView(QGraphicsView):
         
         self._pan_start = None
         self.initial_fit_done = False
+        
+        # --- Configuración del Cursor Visual ---
+        self.cursor_item = QGraphicsEllipseItem()
+        self.cursor_item.setZValue(100)  # Mantener siempre por encima de la máscara
+        self.scene.addItem(self.cursor_item)
+        self.update_cursor_style()
+        self.cursor_item.hide()
+
+    def update_cursor_style(self):
+        """Actualiza el tamaño y color del cursor según la herramienta actual."""
+        s = self.brush_size
+        # Centrar la elipse en (0, 0)
+        self.cursor_item.setRect(-s/2, -s/2, s, s)
+        
+        if self.active_tool == "humo":
+            color = QColor(0, 255, 0)      # Verde
+        elif self.active_tool == "metralla":
+            color = QColor(0, 0, 255)      # Azul
+        else:
+            color = QColor(255, 255, 255)  # Blanco para borrador
+            
+        pen = QPen(color)
+        pen.setWidth(0)  # Pincel cosmético: 1 px constante sin importar el zoom
+        self.cursor_item.setPen(pen)
 
     def load_frame(self, diff_array, label_array):
         self.current_diff_array = diff_array
@@ -125,6 +152,7 @@ class CanvasView(QGraphicsView):
         if event.button() == Qt.MouseButton.RightButton:
             self._pan_start = event.pos()
             self.setCursor(Qt.CursorShape.ClosedHandCursor)
+            self.cursor_item.hide()
         elif event.button() == Qt.MouseButton.LeftButton:
             if self.label_array is None: 
                 return
@@ -136,6 +164,13 @@ class CanvasView(QGraphicsView):
             self.paint_smart_mask(scene_pos, scene_pos)
 
     def mouseMoveEvent(self, event):
+        scene_pos = self.mapToScene(event.pos())
+        
+        # Mover y mostrar siempre el cursor circular (salvo que hagamos pan)
+        if self._pan_start is None:
+            self.cursor_item.setPos(scene_pos)
+            self.cursor_item.show()
+            
         if event.buttons() & Qt.MouseButton.RightButton and self._pan_start is not None:
             delta = event.pos() - self._pan_start
             self.horizontalScrollBar().setValue(self.horizontalScrollBar().value() - int(delta.x()))
@@ -143,7 +178,6 @@ class CanvasView(QGraphicsView):
             self._pan_start = event.pos()
             
         elif self.drawing and event.buttons() & Qt.MouseButton.LeftButton:
-            scene_pos = self.mapToScene(event.pos())
             self.paint_smart_mask(self.last_point, scene_pos)
             self.last_point = scene_pos
             
@@ -153,9 +187,15 @@ class CanvasView(QGraphicsView):
         if event.button() == Qt.MouseButton.RightButton:
             self._pan_start = None
             self.setCursor(Qt.CursorShape.ArrowCursor)
+            self.cursor_item.show()
         elif event.button() == Qt.MouseButton.LeftButton:
             self.drawing = False
         super().mouseReleaseEvent(event)
+        
+    def leaveEvent(self, event):
+        """Ocultar el cursor si el mouse sale del canvas."""
+        self.cursor_item.hide()
+        super().leaveEvent(event)
 
     def paint_smart_mask(self, p1, p2):
         if self.current_diff_array is None: return
@@ -188,6 +228,7 @@ class MainWindow(QMainWindow):
         self.resize(1300, 800)
         self.frames = []
         self.labels_list = [] 
+        self.heatmaps_list = [] 
         self.current_idx = 0
 
         self.playback_timer = QTimer(self)
@@ -201,7 +242,7 @@ class MainWindow(QMainWindow):
 
         top_layout = QHBoxLayout()
         
-        self.btn_load = QPushButton("Cargar (MP4 / NPZ)")
+        self.btn_load = QPushButton("Cargar (MP4 / NPZ / NPY)")
         self.btn_load.clicked.connect(self.load_file)
         
         self.spin_frames = QSpinBox()
@@ -209,7 +250,7 @@ class MainWindow(QMainWindow):
         self.spin_frames.setValue(120)
         self.spin_frames.setToolTip("Cantidad de frames a extraer tras la detonación")
         
-        self.btn_export = QPushButton("Guardar Dataset (.npz)")
+        self.btn_export = QPushButton("Guardar Dataset")
         self.btn_export.setStyleSheet("background-color: #2e8b57; color: white; font-weight: bold;")
         self.btn_export.clicked.connect(self.export_dataset)
         
@@ -293,7 +334,6 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.canvas)
         layout.addLayout(nav_layout)
 
-        # Instalar el filtro global de eventos para asegurar que E y R siempre funcionen
         QApplication.instance().installEventFilter(self)
 
     def eventFilter(self, obj, event):
@@ -333,10 +373,14 @@ class MainWindow(QMainWindow):
         if button == self.radio_humo: self.canvas.active_tool = "humo"
         elif button == self.radio_metralla: self.canvas.active_tool = "metralla"
         else: self.canvas.active_tool = "borrador"
+        # Actualizar estilo visual del cursor
+        self.canvas.update_cursor_style()
 
     def change_brush_size(self, value):
         self.canvas.brush_size = value
         self.lbl_val_size.setText(str(value))
+        # Actualizar diámetro visual del cursor
+        self.canvas.update_cursor_style()
 
     def change_thresh_humo(self, value):
         self.canvas.thresh_humo = value
@@ -351,12 +395,14 @@ class MainWindow(QMainWindow):
             self, 
             "Seleccionar Archivo", 
             "", 
-            "Videos y Datasets (*.mp4 *.avi *.npz)"
+            "Videos y Datasets (*.mp4 *.avi *.npz *.npy)"
         )
         
         if file_path:
             self.lbl_status.setText("Procesando archivo...")
             QApplication.processEvents()
+            
+            self.heatmaps_list = [] 
             
             if file_path.endswith('.npz'):
                 try:
@@ -374,6 +420,31 @@ class MainWindow(QMainWindow):
                 except Exception as e:
                     QMessageBox.critical(self, "Error", f"No se pudo leer el archivo:\n{e}")
                     self.lbl_status.setText("Error al cargar.")
+                    
+            elif file_path.endswith('.npy'):
+                try:
+                    data = np.load(file_path)
+                    
+                    if data.ndim == 4 and data.shape[1] >= 2:
+                        self.frames = list(data[:, 0])      
+                        self.labels_list = list(data[:, 1]) 
+                        if data.shape[1] >= 3:
+                            self.heatmaps_list = list(data[:, 2]) 
+                            
+                    elif data.ndim == 3:
+                        self.frames = list(data)
+                        self.labels_list = [np.zeros_like(f) for f in self.frames]
+                    else:
+                        raise ValueError(f"Formato de dimensiones no soportado: {data.shape}")
+                        
+                    self.current_idx = 0
+                    self.canvas.initial_fit_done = False 
+                    self.update_display()
+                    self.lbl_status.setText(f"Dataset NPY cargado: {len(self.frames)} frames")
+                except Exception as e:
+                    QMessageBox.critical(self, "Error", f"No se pudo leer el archivo NPY:\n{e}")
+                    self.lbl_status.setText("Error al cargar.")
+                    
             else:
                 num_frames = self.spin_frames.value()
                 self.frames = VideoProcessor.extract_climax_sequence(file_path, num_frames=num_frames)
@@ -405,13 +476,25 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Error", "No hay secuencias cargadas.")
             return
             
-        file_path, _ = QFileDialog.getSaveFileName(self, "Guardar Dataset", "", "Numpy Zipped (*.npz)")
+        file_path, selected_filter = QFileDialog.getSaveFileName(
+            self, "Guardar Dataset", "", "Numpy Tensor (*.npy);;Numpy Zipped (*.npz)"
+        )
         if not file_path: return
         
         inputs_tensor = np.stack(self.frames)
         targets_tensor = np.stack(self.labels_list)
         
-        np.savez_compressed(file_path, inputs=inputs_tensor, targets=targets_tensor)
+        if file_path.endswith('.npy'):
+            if self.heatmaps_list:
+                heatmaps_tensor = np.stack(self.heatmaps_list)
+                combined = np.stack([inputs_tensor, targets_tensor, heatmaps_tensor], axis=1)
+            else:
+                combined = np.stack([inputs_tensor, targets_tensor], axis=1)
+            
+            np.save(file_path, combined)
+        else:
+            np.savez_compressed(file_path, inputs=inputs_tensor, targets=targets_tensor)
+            
         QMessageBox.information(self, "Éxito", f"¡Dataset exportado correctamente en:\n{file_path}")
 
 if __name__ == "__main__":
